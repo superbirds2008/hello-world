@@ -1,0 +1,100 @@
+# dhcpd.conf
+#
+# Sample configuration file for ISC dhcpd
+#
+allow booting;
+
+allow bootp;
+# option definitions common to all supported networks...  option domain-name "example.org"; option domain-name-servers 192.168.0.199; default-lease-time 600; max-lease-time 7200; # Use this to enble / disable dynamic dns updates globally.  #ddns-update-style none; # If this DHCP server is the official DHCP server for the local # network, the authoritative
+#directive should be uncommented.  #authoritative; 
+# Use this to send dhcp log messages to a different log file (you also
+# have to hack syslog.conf to complete the redirection).
+log-facility local7;
+
+# No service will be given on this subnet, but declaring it helps the 
+# DHCP server to understand the network topology.
+
+
+# This is a very basic subnet declaration.
+option pxe-system-type code 93 = unsigned integer 16;
+set pxetype = option pxe-system-type;
+
+class "hw-clients" {
+match if substring (option vendor-class-identifier, 0, 3) = "H3C";
+}
+
+class "cisco-clients" {
+match if substring (option vendor-class-identifier, 0, 3) = "CISCO";
+}
+
+subnet 192.168.60.0 netmask 255.255.255.0 {
+     class "CISCO" {
+        match if substring (option vendor-class-identifier, 0, 5) = "CISCO"; 
+	  if option pxe-system-type = 00:02 { #ARCH option 93
+                  filename "ia64/elilo.efi";
+          } else if option pxe-system-type = 00:06 {
+                  filename "grub/grub-x86.efi";
+          } else if option pxe-system-type = 00:07 {
+                  filename "grub/grub-x86_64.efi";
+          } else if option pxe-system-type = 00:09 {
+                  filename "grub/grub-x86_64.efi";
+          } else {
+                  filename "pxelinux.0";
+          }
+        option domain-name "cisco.eth3.org"; 
+          }
+
+     class "H3C" {
+        match if substring (option vendor-class-identifier, 0, 3) = "H3C"; 
+	  if option pxe-system-type = 00:02 { #ARCH option 93
+                  filename "ia64/elilo.efi";
+          } else if option pxe-system-type = 00:06 {
+                  filename "grub/grub-x86.efi";
+          } else if option pxe-system-type = 00:07 {
+                  filename "grub/grub-x86_64.efi";
+          } else if option pxe-system-type = 00:09 {
+                  filename "grub/grub-x86_64.efi";
+          } else {
+                  filename "pxelinux.0";
+          }
+        option domain-name "h3c.eth3.org"; 
+          }
+  range 192.168.60.150 192.168.60.198;
+  option routers 192.168.60.199;
+}
+
+subnet 192.168.58.0 netmask 255.255.255.0 {
+ switch (option vendor-class-identifier) { 
+  case "CISCO": 
+   max-lease-time 17600; 
+   option domain-name "cisco.eth1.org"; 
+   break; 
+
+  case "H3C": 
+   max-lease-time 17600; 
+   option domain-name "h3c.eth1.org"; 
+   break; 
+ } 
+  range 192.168.58.150 192.168.58.198;
+  option routers 192.168.58.199;
+}
+
+subnet 192.168.59.0 netmask 255.255.255.0 {
+ switch (option vendor-class-identifier) { 
+  case "CISCO": 
+   max-lease-time 17600; 
+   option domain-name "cisco.eth2.org"; 
+   break; 
+
+  case "H3C": 
+   max-lease-time 17600; 
+   option domain-name "h3c.eth2.org"; 
+   break; 
+ } 
+  range 192.168.59.150 192.168.59.198;
+  option routers 192.168.59.199;
+}
+subnet {{ infra.network }} netmask 255.255.255.0 {
+  range 192.168.1.101 192.168.1.199;
+  option routers {{ infra.gateway}};
+}

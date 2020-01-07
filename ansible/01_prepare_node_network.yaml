@@ -1,0 +1,199 @@
+---
+# - name: Prep Nodes
+#   hosts: kube
+#   become: yes
+#
+#   tasks:
+#     - name: Create Setup Directories
+#       with_items:
+#         - /home/developer/kubesetup
+#         - /home/developer/kubesetup/network
+#       file:
+#         name: "{{ item }}"
+#         state: directory
+#         mode: 0755
+#
+- name: Configure Network Interface for openshift to ACI
+  hosts: vagnodes 
+  become: yes
+
+  tasks:
+    - name: Create Ethernet Configuration File
+      template:
+        src: templates/ifcfg-INT.j2
+        dest: /etc/sysconfig/network-scripts/ifcfg-{{ aci_interface }}
+        owner: root
+        group: root
+        mode: 0644
+      register: modify_nics 
+
+    - name: Create Node VLAN Interface
+      template:
+        src: templates/node-ifcfg.j2
+        dest: /etc/sysconfig/network-scripts/ifcfg-{{ aci_interface }}.{{ node.vlan }}
+        owner: root
+        group: root
+        mode: 0644
+      register: modify_nics 
+      
+    - name: Remove Default Route from Node Interface
+      with_items:
+        - "DEFROUTE=yes"
+      lineinfile:
+        path: /etc/sysconfig/network-scripts/ifcfg-{{ mgmt.interface }}
+        line: "{{ item }}"
+        state: absent 
+      when: vagrant is not defined
+      register: modify_nics
+
+    - name: Create Infra VLAN Interface
+      template:
+        src: templates/infra-ifcfg.j2
+        dest: /etc/sysconfig/network-scripts/ifcfg-{{ aci_interface }}.{{ infra.vlan }}
+        owner: root
+        group: root
+        mode: 0644
+      register: modify_nics 
+
+    - name: Restart Network
+      service:
+        name: network
+        state: restarted
+      when: modify_nics.changed
+
+    - name: Re-query facts for new interfaces
+      setup:
+        gather_subset: all
+
+    - name: Create DHCP Client Configuration for Infra
+      template:
+        src: templates/infra_dhclient.j2
+        dest: /etc/dhcp/dhclient-{{ aci_interface }}.{{ infra.vlan }}.conf
+        owner: root
+        group: root
+        mode: 0644
+      register: modify_nics_2nd
+
+    - name: Add Fabric Multicast Subnet Route
+      template:
+        src: templates/infra_route.j2
+        dest: /etc/sysconfig/network-scripts/route-{{ aci_interface }}.{{ infra.vlan }}
+        owner: root
+        group: root
+        mode: 0644
+      register: modify_nics_2nd
+
+    - name: Remove Default Route from Mgmt Interface, pt1
+      with_items:
+        - "DEFROUTE=no"
+      lineinfile:
+        path: /etc/sysconfig/network-scripts/ifcfg-{{ mgmt.interface }}
+        line: "{{ item }}"
+        state: present
+      when: vagrant is undefined
+      register: modify_nics_2nd
+
+    - name: Remove Default Route from Mgmt Interface, pt2
+      with_items:
+        - "DEFROUTE=yes"
+      lineinfile:
+        path: /etc/sysconfig/network-scripts/ifcfg-{{ mgmt.interface }}
+        line: "{{ item }}"
+        state: absent
+      when: vagrant is undefined
+      register: modify_nics_2nd
+
+    - name: Restart Network
+      service:
+        name: network
+        state: restarted
+      when: modify_nics_2nd.changed
+
+
+- name: Prepare network ACI parameters on all nodes
+  hosts: vagnodes 
+  become: yes
+
+  tasks:
+    - name: Add iptables acl to allow igmp 
+      with_items:
+        - "iptables -A INPUT -p igmp -j ACCEPT"
+      lineinfile:
+        path: /etc/rc.d/rc.local 
+        line: "{{ item }}"
+        state: present
+
+    - name: set the maximum EPG number 
+      with_items:
+        - "net.ipv4.igmp_max_memberships = Max_Number_Of_EPGs"
+        - "kernel.hostname = {{ ansible_hostname }}.{{ default_subdomain }}"
+      lineinfile:
+        path: /etc/sysctl.d/99-sysctl.conf  
+        line: "{{ item }}"
+        state: present
+      tags: hosts
+
+    - name: modify /etc/hosts
+      with_items:
+        - "{{ openshift_ip }} {{ ansible_hostname }}"
+        - "{{ master_node_ip }} {{ master_hostname }}.{{ default_subdomain }}"
+        - "{{ node1_node_ip }} {{ node1_hostname }}.{{ default_subdomain }}"
+        - "{{ node2_node_ip }} {{ node2_hostname }}.{{ default_subdomain }}"
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ item }}"
+        state: present
+      tags: hosts
+      when: vagrant is undefined
+
+    - name: modify /etc/hosts
+      with_items:
+        - "10.0.2.15 {{ master_hostname }}.{{ default_subdomain }}"
+        - "10.0.2.15 {{ node1_hostname }}.{{ default_subdomain }}"
+        - "10.0.2.15 {{ node2_hostname }}.{{ default_subdomain }}"
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ item }}"
+        state: present
+      tags: hosts
+      when: vagrant is defined
+
+    - name: Reload sysctl values
+      command: sysctl -p 
+      become_user: root 
+      # ignore_errors: yes
+      tags: host
+
+    # - name: modify hostname  FQDN
+      # become: yes
+      # become_user: root
+      # replace:
+        # path: /etc/hosts
+        # regexp: '(^127\.0\.0\.1)(\s+)({{ ansible_hostname }})(.*)$'
+        # replace: '127.0.0.1 {{ ansible_hostname}} {{ ansible_hostname }}.{{ default_subdomain }}'
+      # tags: hosts
+
+    # - name : debug vars
+    #   debug:
+    #     # var: master_hostname, openshift_master_cluster_public_hostname, openshift_master_default_subdomain
+    #     # var: master_node_ip 
+    #     var: openshift_master_cluster_hostname, openshift_master_cluster_public_hostname, openshift_master_default_subdomain
+    #   tags: debug 
+
+    # - name: copy openshift repo to ndoes
+    #   copy:
+    #     src: ./CentOS-OpenShift-Origin311.repo
+    #     dest: /etc/yum.repos.d/CentOS-OpenShift-Origin311.repo
+    #   tags: repo 
+
+    # - name: enable repo cache 
+      # command: sed -i -e "s/^keepcache=0/keepcache=1/" /etc/yum.conf
+      # command: sed -i -e "s/^keepcache=1/keepcache=0/" /etc/yum.conf
+      # become_user: root 
+      # warn: false
+      # tags: repo 
+
+    # - name: Restart Network
+    #   service:
+    #     name: network
+    #     state: restarted

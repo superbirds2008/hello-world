@@ -1,0 +1,520 @@
+---
+
+# See https://docs.openshift.com/container-platform/3.11/install/host_preparation.html
+
+- name: Prepare hosts for an OpenShift installation
+  hosts: vagnodes 
+  become: yes
+
+  tasks:
+  - name: Set net.ipv4.ip_forward = 1
+    sysctl:
+      name: net.ipv4.ip_forward
+      value: 1
+      state: present
+      reload: yes
+    register: ip_forward
+    tags: network
+
+  - name: Reboot if the ip_forward state has changed
+    shell: 'sleep 5 && /sbin/shutdown -r now "reboot triggered by Ansible"'
+    async: 1
+    poll: 0
+    when: ip_forward.changed
+    tags: network
+
+  - name: Wait for the reboot to complete
+    wait_for_connection:
+      connect_timeout: 5
+      sleep: 5
+      delay: 10
+      timeout: 300
+    when: ip_forward.changed
+    tags: network
+
+  - name: Read the current value of net.ipv4.ip_forward
+    command: sysctl -n net.ipv4.ip_forward
+    changed_when: false
+    register: sysctl
+    tags: network
+
+  - name: Check that net.ipv4.ip_forward = 1
+    assert:
+      that:
+      - ip_forward_value == '1'
+      msg: >
+        The sysctl variable 'net.ipv4.ip_forward' needs to be enabled.
+        If you stumbled on this message, there is a high chance you have this
+        setting hardcoded somewhere. You will have to change it by yourself
+        and re-run this playbook.
+    vars:
+      ip_forward_value: '{{ sysctl.stdout_lines[0] }}'
+    tags: network
+
+  - name: Uninstall things that might interfere with DNS
+    yum:
+      name: '{{ item }}'
+      state: absent
+    with_items:
+    - nscd
+    - bind
+    - bind-chroot
+    tags: rpm,dns
+
+  - name: Make sure iproute is installed (provides the "ss" command)
+    yum: 
+      name: iproute
+      state: installed
+    tags: rpm,dns
+
+  - name: Check who is listening on port 53
+    command: ss -tupln sport = :53
+    # command: ss -tuplnH sport = :53
+    changed_when: false
+    register: ss
+    tags: dns
+  
+  - name: Make sure no one is listening on port 53
+    assert:
+      that:
+      - 'port_53_listeners|int == 1'
+      msg: >
+        You have something listening on port 53. This will collide with dnsmasq
+        that comes with OpenShift. Please inspect and fix this !
+    vars:
+      port_53_listeners: '{{ ss.stdout_lines|length }}'
+    tags: dns
+
+  - name: Check if /etc/kubernetes exists
+    stat:
+      path: /etc/kubernetes
+    register: etc_kubernetes
+    tags: checks
+
+  - name: Check if /etc/cni exists
+    stat:
+      path: /etc/cni
+    register: etc_cni
+    tags: checks
+
+  - name: Check if there is an old version of Kubernetes installed
+    assert:
+      that:
+      - "'KUBE_CONFIG' not in ansible_env"
+      - "not etc_kubernetes.stat.exists"
+      - "not etc_cni.stat.exists"
+      msg: An old installation of Kubernetes may have been found
+    tags: checks
+
+  - name: Make sure SELinux is enabled
+    lineinfile:
+      path: /etc/sysconfig/selinux
+      line: 'SELINUX=enforcing'
+      regexp: '^ *SELINUX='
+      state: present
+    register: selinux
+    tags: selinux
+    # when: ansible_distribution != "CentOS"
+
+
+  - name: Reboot if SELinux state has changed
+    shell: 'sleep 5 && /sbin/shutdown -r now "reboot triggered by Ansible"'
+    async: 1
+    poll: 0
+    when: selinux.changed
+    tags: selinux
+
+  - name: Waiting for server(s) to come back
+    wait_for_connection:
+      connect_timeout: 5
+      sleep: 5
+      delay: 10
+      timeout: 300
+    when: selinux.changed
+    tags: selinux
+
+  - name: Install the required software
+    yum:
+      name: '{{ item }}'
+      state: installed
+    with_items:
+    - wget
+    - git
+    - etcd
+    - net-tools
+    - bind-utils
+    - iptables-services
+    - bridge-utils
+    - bash-completion
+    - kexec-tools
+    - sos
+    - psacct
+
+  - name: Install some optional software
+    yum:
+      name: '{{ item }}'
+      state: installed
+    with_items:
+    - vim-enhanced
+    - tmux
+    - unzip
+    - tcpdump
+    - telnet
+    - strace
+    - man-pages
+    - man
+    - iptraf
+    - wget
+    - openssh-clients
+    - httpd-tools
+    - net-tools
+    - nfs-utils
+    - yum-utils
+    - openldap-clients
+    tags: rpm
+
+  - name: Install NetworkManager
+    yum:
+      name: NetworkManager
+      state: installed
+    tags: rpm,NetworkManager
+
+  - name: Make sure NetworkManager is enabled
+    service:
+      name: NetworkManager
+      state: started
+      enabled: yes
+    tags: rpm,NetworkManager
+
+  - name: Make sure NetworkManager is enabled for the default interface
+    block: 
+    - name: Enable NM_CONTROLLED
+      lineinfile:
+          path: /etc/sysconfig/network-scripts/ifcfg-{{ interface }}
+          regexp: '^\s*NM_CONTROLLED='
+          backup: yes
+          state: present
+          line: NM_CONTROLLED=yes
+      register: nm_controlled
+    - name: Enable PEERDNS
+      #把DHCP服务器提供的DNS服务器地址添加到本机/etc/resolv.conf中
+      lineinfile:
+          path: /etc/sysconfig/network-scripts/ifcfg-{{ interface }}
+          regexp: '^\s*PEERDNS='
+          backup: yes
+          state: present
+          line: PEERDNS=yes
+      register: peer_dns
+    - name: Check if BOOTPROTO is set
+      shell: source /etc/sysconfig/network-scripts/ifcfg-{{ interface }} && echo -n $BOOTPROTO
+      register: bootproto
+      changed_when: false
+    - name: Check if DNS1 is set
+      shell: source /etc/sysconfig/network-scripts/ifcfg-{{ interface }} && echo -n $DNS1
+      register: dns1
+      changed_when: false
+    - name: Check that DNS are set in ifcfg-eth* when IP is static
+      assert:
+        that:
+        - (ip_is_static and dns_is_set) or not ip_is_static
+        msg: >
+          Your default network interface ({{ interface }}) is set with a
+          static IP and has no DNS set in ifcfg-{{ interface }}.
+          Set DNS1= and DNS2= in
+          /etc/sysconfig/network-scripts/ifcfg-{{ interface }} and reload
+          your network configuration with /etc/init.d/network restart
+      vars:
+        ip_is_static: '{{ bootproto.stdout == "none" }}'
+        dns_is_set: '{{ dns1.stdout|length > 0 }}'
+    vars:
+      interface: '{{ ansible_default_ipv4.interface }}'
+    tags: NetworkManager
+
+  - name: Reload the network configuration
+    shell: 'sleep 5 && /etc/init.d/network restart'
+    async: 1
+    poll: 0
+    when: nm_controlled.changed or peer_dns.changed
+    tags: NetworkManager
+
+  - name: Waiting for the connection come back
+    wait_for_connection:
+      connect_timeout: 5
+      sleep: 5
+      delay: 10
+      timeout: 300
+    when: nm_controlled.changed or peer_dns.changed
+    tags: NetworkManager
+
+  - name: Make sure the system is up-to-date
+    yum:
+      name: '*'
+      state: latest
+    tags: rpm
+
+  - name: Make sure the wildcard dns domain is defined in the inventory
+    assert:
+      that:
+      - openshift_master_default_subdomain is defined
+      msg: >
+        Please define the "openshift_master_default_subdomain" variable in your
+        inventory file!
+    tags: dns
+
+  - name: Check if the wildcard dns domain is working
+    command: 'host {{ sample_record }}'
+    vars:
+      sample_record: 'test-{{ ansible_date_time.epoch }}.{{ openshift_master_default_subdomain }}'
+    changed_when: false
+    tags: dns
+
+  - name: Get the machine FQDN
+    command: hostname -f
+    register: hostname_f
+    changed_when: false
+    tags: dns
+  
+  # - name: Remove FQDN tailing
+    # command: echo -n {{ hostname_f }}
+    # resiter: hostname_f
+    # changed_when: false
+    # tags: dns
+
+  - set_fact:
+      discovered_fqdn: '{{ hostname_f.stdout_lines[0] }}'
+    tags: dns
+
+
+  - name: Make sure the hostnames are consistent
+    assert:
+      that:
+      - inventory_hostname_short == discovered_hostname
+      - inventory_hostname == discovered_fqdn
+      msg: >
+        inventory_hostname_short is {{ inventory_hostname_short }}.  
+        discovered_hostname is {{ discovered_hostname }}.
+        inventory_hostname is {{ inventory_hostname }}.  
+        discovered_fqdn is {{ discovered_fqdn }}
+
+
+
+        Your hostnames are not consistent ! Check your /etc/hosts, 
+        /etc/sysconfig/hostname and the output of "hostnamectl status". 
+    vars:
+      discovered_hostname: '{{ ansible_hostname }}'
+    tags: dns
+
+  - name: Find the IP Address behind the hostname of this machine
+    command: getent ahosts '{{ discovered_fqdn }}'
+    register: getent_ahosts_cmd
+    changed_when: false
+    tags: dns
+
+  - block:
+    - name: Make sure the FQDN resolves to only one IP address
+      assert:
+        that:
+        - discovered_public_ips|length == 1
+        msg: >
+          I found that this machine fqdn ({{ inventory_hostname}}) resolves to 
+          {{ discovered_public_ips|length }} IPs and that could cause issues.
+          Please fix this !
+
+    - name: Make sure the FQDN resolves to the IP address of the network interface holding the default route
+      assert:
+        that:
+        - '"interface" in ansible_default_ipv4'
+        - ansible_default_ipv4.address == discovered_public_ips|first
+        msg: 
+          - "The IP behind this machine FQDN does not resolves to the network interface holding the default route."
+          - "ansible_default_ipv4.interface(var interface) is {{ ansible_default_ipv4.interface }}"
+          - "ansible_default_ipv4 is  {{ ansible_default_ipv4 }}"
+          - "ansible_default_ipv4.address is {{ ansible_default_ipv4.address }}"
+          - "discovered_public_ips is {{ discovered_public_ips }}"
+    #在ACI环境中注释掉下面命令
+    # ignore_errors: yes
+
+    vars:
+      discovered_public_ips: '{{ getent_ahosts_cmd.stdout_lines|select(''search'', ''\bSTREAM\b'')|map(''regex_replace'', ''^(\S+)\s+STREAM\b.*$'', ''\1'')|list }}'
+    tags: dns
+
+  - name: First, disable any repos (using subscription-manager)
+    command: subscription-manager repos --disable="*"
+    tags: rpm
+    # ignore_errors: yes
+    when: ansible_distribution != "CentOS"
+
+  - name: Make sure mandatory repos are enabled
+    command: subscription-manager repos --enable {{ item }}
+    with_items:
+      - rhel-7-server-rpms
+      - rhel-7-server-extras-rpms
+      - rhel-7-server-ose-{{ ocp_version }}-rpms
+      - rhel-7-server-ansible-2.6-rpms
+    tags: rpm
+    # ignore_errors: yes
+    when: ansible_distribution != "CentOS"
+
+  - name: Install Docker
+    yum:
+      name: 'docker-{{ docker_version }}'
+      state: installed
+    tags: rpm,docker
+    when: install_docker
+
+  - name: Find the filesystem hosting /var/lib/docker
+    command: df -k /var/lib/docker
+    register: df
+    changed_when: false
+    tags: docker
+    when: install_docker
+
+  - name: Make sure the filesystem hosting /var/lib/docker is formatted as XFS
+    assert:
+      that:
+      - 'docker_filesystem == ''xfs'''
+      msg: "The filesystem holding /var/lib/docker must be formatted as XFS"
+    vars:
+      docker_mount_point: '{{ df.stdout_lines[1].split()[5] }}'
+      # TODO: replace match with "equalto" as soon as the Jinja shipped with RHEL is updated
+      docker_filesystem: '{{ ansible_mounts|selectattr(''mount'', ''match'', ''^'' ~ docker_mount_point ~ ''$'')|map(attribute=''fstype'' )|first }}'
+    tags: docker
+    when: install_docker
+      
+  - name: Stop Docker
+    service:
+      name: docker
+      state: stopped
+      enabled: yes
+    tags: docker
+    when: install_docker
+
+  - name: Make sure overlayfs is enabled
+    lineinfile:
+      path: /etc/sysconfig/docker-storage
+      line: 'DOCKER_STORAGE_OPTIONS="--storage-driver overlay2"'
+      regexp: '^ *DOCKER_STORAGE_OPTIONS='
+      state: present
+    register: docker_storage
+    tags: docker
+    when: install_docker
+
+  - name: Cleanup the Docker local storage
+    file:
+      path: /var/lib/docker
+      state: absent
+    tags: docker
+    when: 
+      - ansible_distribution == "CentOS"
+      - install_docker
+
+  - name: Add docker selinux-enable=false when os is CentOS 
+    with_items:
+      - "OPTIONS='--selinux-enabled=false --log-driver=journald --signature-verification=false'"
+    lineinfile:
+      path: /etc/sysconfig/docker 
+      line: "{{ item }}"
+      state: present
+    tags: docker
+    when: 
+      - ansible_distribution == "CentOS"
+      - install_docker
+
+  - name: Remove docker selinux-enable when os is CentOS 
+    with_items:
+      - "OPTIONS='--selinux-enabled --log-driver=journald --signature-verification=false'"
+    lineinfile:
+      path: /etc/sysconfig/docker 
+      line: "{{ item }}"
+      state: absent 
+    tags: docker
+    when: 
+      - ansible_distribution == "CentOS"
+      - install_docker
+
+  - name: Start Docker
+    service:
+      name: docker
+      state: started
+      enabled: yes
+    tags: docker, start_docker
+    when: install_docker
+
+  # - name: Install openshift-ansible
+    # yum:
+      # name: openshift-ansible
+      # state: installed
+    # tags: rpm,openshift
+
+
+# - name: Prepare installation host for an OpenShift 3.11 installation
+#   hosts: vag-master
+#   become: yes
+
+#   tasks:
+#   - name: Install ansible
+#     yum:
+#       name: '{{ item }}'
+#       state: installed
+#     with_items:
+#     - ansible
+#     - pyOpenSSL
+#     tags: ansible 
+#     when: local_install_ansible
+
+
+#   - name: Clone and checkout openshift-ansible from GIT
+#     git:
+#       repo: 'https://github.com/openshift/openshift-ansible'
+#       dest: ~/openshift-ansible
+#       version: release-{{ ocp_version }}
+#     tags: ansible 
+#     when: local_install_ansible
+
+#   - name: Add ansible inventory file to ansible host
+#     copy:
+#       src: ./inventory/hosts.yml
+#       dest: ~/openshift-ansible/inventory/hosts.yml
+#       # owner: root 
+#       # group: root 
+#       mode: '0644'
+#     tags: ansible
+#     when: local_install_ansible
+
+#   - name: Add ansible inventory file to ansible host
+#     copy:
+#       src: ~/Documents/Dev/TOKD3.11/.vagrant/machines/vag-master/virtualbox/private_key 
+#       dest: ~/Documents/Dev/TOKD3.11/.vagrant/machines/vag-master/virtualbox/private_key
+#       owner: root 
+#       group: root 
+#       mode: '0644'
+#     tags: ansible
+#     when: local_install_ansible
+
+#   - name: Add ssh_id shell script
+#     copy:
+#       src: ./add_ssh_id.sh
+#       dest: /home/root/openshift-ansible/add_ssh_id.sh
+#       owner: root 
+#       group: root 
+#       mode: '0744'
+#     tags: ansible
+#     when: local_install_ansible
+
+- name: Reboot all nodes
+  hosts: vagnodes 
+  become: yes
+  tasks:
+  - name: Reboot all nodes
+    shell: 'sleep 5 && /sbin/shutdown -r now "reboot triggered by Ansible"'
+    async: 1
+    poll: 0
+    tags: reboot 
+
+  - name: Wait for the reboot to complete
+    wait_for_connection:
+      connect_timeout: 5
+      sleep: 5
+      delay: 10
+      timeout: 300
+    tags: reboot 

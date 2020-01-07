@@ -1,0 +1,14 @@
+DEVICE={{ aci_interface }}.{{ infra.vlan }}
+ONBOOT=yes
+VLAN=yes
+MTU=1600
+BOOTPROTO=none
+IPADDR={{ infra.ip }}
+PREFIX={{ infra.prefix }}
+NETWORK={{ infra.network }}
+DEFROUTE=yes
+GATEWAY={{ infra.gateway }}
+DNS1={{ dns.primary }}
+DNS2={{ dns.secondary }}
+IPV6_PRIVACY=no
+#ONPARENT=yes
